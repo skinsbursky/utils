@@ -1,0 +1,6 @@
+1) Modify make_sandbox.c to set proper new namespaces on clone
+2) Copy enter-sandbox script to /root
+3) Download centos6 template from openvz and untar it it /root/centos-6 (or
+modify enter-sandbox).
+4) Copy init-sandbox to /root/centos-6/root/
+5) Build make_sandbox.c and execute it
