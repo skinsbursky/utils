@@ -19,7 +19,7 @@ int exec_bash(void *data)
 	pid = getpid();
 	sprintf(str_pid, "%d", pid);
 	argv[0] = "test_bash";
-	//argv[1] = "/root/enter-sandbox";
+	argv[1] = "/root/enter-sandbox";
 
 	printf("Child is going to exec /bin/bash %s\n", argv[1]);
 	execve("/bin/bash", argv, NULL);
@@ -45,7 +45,9 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
-	child_pid = clone(exec_bash, child_stack + 16384, CLONE_NEWNET |  SIGCHLD , NULL);
+//	child_pid = clone(exec_bash, child_stack + 16384, CLONE_NEWNET |  SIGCHLD , NULL);
+//	child_pid = clone(exec_bash, child_stack + 16384, CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWNS | SIGCHLD , NULL);
+	child_pid = clone(exec_bash, child_stack + 16384, CLONE_NEWPID | CLONE_NEWNET | SIGCHLD , NULL);
 	printf("Child pid: %d\n", child_pid);
 	if (child_pid == -1) {
 		printf("Failed to clone child: %d\n", errno);
