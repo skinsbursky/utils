@@ -1,0 +1,5 @@
+#!/bin/bash
+sleep 1
+PATH=$PATH:/sbin:/usr/sbin:/bin
+chroot /root/centos-6 /bin/bash /root/init-sandbox
+#chroot /root/centos-6 /bin/bash

@@ -1,0 +1,485 @@
+#!/bin/bash
+
+[ -n "$*" ] || {
+cat<<EOF
+usage:
+	kload [option]...
+
+option:
+	-H --host	<host>
+	-R --release	[<release>][#<nick>][<index>]
+	-N --nickname	<nick>
+	-C --chroot	<path>
+
+	-S --status
+	-I --install	<source>|<package>	upload kernel
+	-U --uninstall	<suffix>
+	-K --vmlinuz	<source>|<image>	upload vmlinuz
+	-X --kexec	[argument]...
+	-L --link	[suffix]		make symlinks /boot/{vmlinuz,initrd.img}[suffix]
+	-B --reboot
+	-P --panic				trigger panic
+	-D --mkinitrd	[cmd arg...]
+	-T --tar	<source> [tarball]
+	-M --renick	<new-nickname>
+
+	-k --kernel	<kernel>
+	-i --initrd	<initrd>
+	-a --append	<append>
+	-n --no-initrd
+	-x --xexec
+
+	-d --debug
+	-v --verbose
+
+argument:
+	<flag>	<arg>=<val>		set
+	-<flag>	-<arg>=<val>		unset
+	+<arg>	+<arg>=<val>		append
+
+example:
+	show current and avaliable kernels:
+	kload -H foo -S
+
+	install and boot kernel with extra command line changes:
+	kload -H foo -I bar.rpm -X debug slub_debug=FZPU panic=15 console=ttyS0,115200n8 console=tty
+
+	install and boot kenrel from source tree with nickname:
+	kload -N bar -I . -X
+
+	build special initrd:
+	kload -R bar -D "mkinitrd -f -v --with=xxx"
+
+EOF
+exit
+}
+
+
+error () {
+	echo error: $@ 1>&2
+	exit 2
+}
+
+quiet=1
+verbose () {
+	true
+}
+
+if [ $UID = 0 ] ; then
+do_call () {
+	eval "$@"
+}
+else
+do_call () {
+	sudo sh -c "$*"
+}
+fi
+
+quote () {
+	#non bash, less strong quoting
+	#for a in "$@" ; do echo -n \'${a}\'\  ; done
+	for a in "$@" ; do echo -n \'${a//\'/\'\\\'\'}\'\  ; done
+}
+
+call () {
+	verbose call: "$@"
+	#do_call "${@//\'/\'\\\'\'}"
+	do_call $(quote "$@")
+}
+
+call_weak () {
+	verbose call_weak: "$@"
+	do_call "$@"
+}
+
+portal_init() {
+	[ -n "$portal" ] && return
+	portal=$(call mktemp -d) || error "portal init"
+}
+
+portal_clean() {
+	[ -z "$portal" ] && return
+	verbose "portal cleanup"
+	call rm -fr "$portal"
+	unset portal
+}
+
+portal() {
+	verbose "portal: $@"
+	src="$1"
+	shift
+	dst="$1"
+	shift
+	if [ "$dst" ] ; then
+		if [ -d "$src" ] ; then
+			call mkdir -p "$dst" || error "portal mkdir $dst"
+			tar cz -C "$src" "${@:-.}" | call tar xz -m -C "$dst"
+		else
+			cat "$src" | call_weak cat\>$(quote "$dst")
+		fi
+	else
+		portal_init
+		dst=$(basename "$src")
+		src=$(dirname "$src")
+		echo "$portal/$dst"
+		tar cz -C "$src" "$dst" | call tar xz -m -C "$portal"
+	fi || error "portal $src to $dst"
+}
+
+launchpad_create() {
+	[ -n "$launchpad" ] && error "recreate launchpad"
+	launchpad=$(mktemp -d) || error "launchpad create"
+	verbose "launchpad: $launchpad"
+}
+
+launchpad_destroy() {
+	[ -d "$launchpad" ] || error "launchpad destroy"
+	verbose "launchpad destroy"
+	rm -fr "$launchpad"
+	unset launchpad
+}
+
+kernel_remove () {
+	[ "$1" ] || error "no kernel to remove"
+	verbose "remove: $1"
+	call rm -fr "$chroot/lib/modules/$1"
+	call find "$chroot/boot" -regex "$chroot/boot/[^-]*-$1\\(.img\\)?" -delete
+}
+
+kernel_switch () {
+	[ "$nickname" ] || return
+	call ln -sfT "$suffix" "$chroot/lib/modules/$release" || error "error while symlinking kernel modules"
+}
+
+kernel_source() {
+	release="${release-$(make -s -C "$source" kernelrelease)}" || error "can not detect source release"
+	arch=$(readlink "$source/include/asm" | sed 's/asm-//')
+	vmlinux="$source/vmlinux"
+	vmlinuz="$source/arch/$arch/boot/bzImage"
+	config="$source/.config"
+	systemmap="$source/System.map"
+}
+
+kernel_vmlinuz () {
+	if [ -d "$1" ] ; then
+		source=$1
+		kernel_source
+		kernel_detect
+	else
+		kernel_detect
+		vmlinuz="$1"
+	fi
+	portal "$vmlinuz" "$chroot$kernel"
+}
+
+kernel_install () {
+	kernel_source
+	make ${quiet+-s} -C "$source" INSTALL_MOD_PATH="$launchpad" INSTALL_MOD_STRIP=1 modules_install || exit 2
+	depmod -b "$launchpad" $release
+	mkdir "$launchpad/boot"
+	cat "$vmlinuz" > "$launchpad/boot/vmlinuz-$release"
+	bzip2 -c "$vmlinux" > "$launchpad/boot/vmlinux.bz2-$release"
+	cat "$config" > "$launchpad/boot/config-$release"
+	cat "$systemmap" > "$launchpad/boot/System.map-$release"
+}
+
+kernel_initrd () {
+	initrd=${initrd-"/boot/initrd-$suffix"}
+	call $CHROOT depmod $release
+	if [ "$mkinitrd" ] ; then
+#		call $CHROOT $mkinitrd "$initrd" $release
+		call $CHROOT $mkinitrd
+	else
+		call $CHROOT mkinitrd ${verbose+-v} -f "$initrd" $release ||
+		call $CHROOT mkinitramfs ${verbose+-v} -o "$initrd" $release ||
+		call $CHROOT mkinitrd -k ${kernel} -i ${initrd}
+	fi
+	call test -f "$chroot$initrd" || error "error while making initrd"
+}
+
+kernel_unpack () {
+	verbose "unpack: $1"
+	case "$1" in
+	*.rpm)
+		rpm2cpio "$1" | ( cd "$launchpad"  ; cpio -id --quiet )
+	;;
+	*.deb)
+		dpkg-deb --fsys-tarfile "$1" | tar x -C "$launchpad"
+	;;
+	*.tgz|*.tar.gz)
+		tar xzf "$1" -C "$launchpad"
+	;;
+	*.tbz|*.tar.bz2)
+		tar xjf "$1" -C "$launchpad"
+	;;
+	*)
+		source="$1"
+		kernel_install
+	;;
+	esac
+
+	release=$(basename $launchpad/lib/modules/*)
+	[ -d "$launchpad/lib/modules/$release" ] || error "error in release detect"
+
+	suffix=$release${nickname:+"#$nickname"}
+
+	if [ "$nickname" ] ; then
+		mv $launchpad/lib/modules/$release $launchpad/lib/modules/$suffix
+		rename "s/-$release$/-$suffix/" $launchpad/boot/*
+	fi
+}
+
+kernel_renick() {
+	newnick="$1"
+	newsuffix=$release${newnick:+"#$newnick"}
+	#call test -e "$chroot/lib/modules/$newsuffix" && error "target exists"
+	call mv "$chroot/lib/modules/$suffix" "$chroot/lib/modules/$newsuffix"
+	call_weak rename "s/-$suffix$/-$newsuffix/" "$chroot/boot/\*-$suffix"
+	nickname="$newnick"
+	suffix="$newsuffix"
+}
+
+kernel_upload () {
+	launchpad_create
+	kernel_unpack "$1"
+	kernel_remove "$suffix"
+	portal "$launchpad" "$chroot/" boot lib/modules
+	launchpad_destroy
+}
+
+kernel_append() {
+   C="${append-$(call cat /proc/cmdline)}"
+   B=""
+   for O in "$@" ; do
+	case "$O" in
+	+*)
+		F=""
+		B="$B ${O#+}"
+	;;
+	-*)
+		F="${O#-}"
+	;;
+	*=*)
+		F="${O%%=*}"
+		B="$B $O"
+	;;
+	*)
+		F="${O}"
+		B="$B $O"
+	;;
+	esac
+	if [ "$F" ] ; then
+		R=""
+		for A in $C ; do
+			[ "${A}" != "$F" -a "${A%%=*}" != "$F" ] && R+="$A "
+		done
+		C="$R"
+	fi
+   done
+   append="$C$B"
+}
+
+kernel_detect () {
+	release=${release-$(call uname -r)}
+	suffix=$release${nickname+"#$nickname"}
+	kernel=${kernel-"/boot/vmlinuz-$suffix"}
+
+	if [ "$no_initrd" ] ; then
+		unset initrd
+		return
+	fi
+
+	[ "$initrd" ] && return
+
+	initrd="/boot/initrd-$suffix"
+	call test -f "$chroot$initrd" && return
+
+	initrd="/boot/initrd.img-$suffix"
+	call test -f "$chroot$initrd" && return
+
+	initrd="/boot/initrd-$suffix.img"
+	call test -f "$chroot$initrd" && return
+
+	unset initrd
+}
+
+kernel_check () {
+	call test -f "$chroot$kernel" || error "kernel not found"
+	[ "$no_initrd" ] && return
+	[ "$initrd" ] && call test -f "$chroot$initrd" || error "initrd not found"
+}
+
+kernel_kexec () {
+	echo $suffix $append
+	call kexec --load "$chroot$kernel" \
+		${initrd:+"--initrd=$chroot$initrd"} \
+		--append="$append" || exit 2
+}
+
+kernel_panic () {
+	echo $suffix $append
+	call kexec --load-panic "$chroot$kernel" \
+		${initrd:+"--initrd=$chroot$initrd"} \
+		--append="$append"
+	call_weak echo c \>/proc/sysrq-trigger
+}
+
+kernel_status() {
+	call_weak uname -a \; cat /proc/cmdline
+}
+
+kernel_reboot () {
+	if [ "$xexec" ] ; then
+		call kexec -e &
+	else
+		call reboot
+	fi
+	[ "$host" ] || exit
+	echo -n re
+	while netcat -w 1 -z $host 22 ; do sleep 1 ; echo -n e ; done
+	echo -n bo
+	while ! netcat -w 1 -z $host 22 ; do sleep 1 ; echo -n o ; done
+	echo ot
+	kernel_status
+}
+
+while [ "$*" ] ; do
+command="$1"
+shift
+case $command in
+-H|--host)
+	host=$1
+	do_call() {
+		ssh root@$host "$@"
+	}
+	shift
+	;;
+-C|--chroot)
+	chroot=$1
+	CHROOT="chroot $1"
+	shift
+	;;
+-R|--release)
+	case "$1" in
+	*#*)
+		release=${1%%#*}
+		nickname=${1#*#}
+	;;
+	\#*)
+		nickname=${1#\#}
+	;;
+	[0-9]|[1-9][0-9])
+	;;
+	*)
+		release=$1
+	;;
+	esac
+	shift
+	;;
+-N|--nickname)
+	nickname="$1"
+	shift
+	;;
+-I|--install)
+	kernel_upload "$1"
+	kernel_detect
+	kernel_switch
+	kernel_initrd
+	shift
+	;;
+-K|--vmlinuz)
+	kernel_vmlinuz "$1"
+	shift
+	;;
+-D|--mkinitrd)
+	mkinitrd="$1"
+	shift
+	if [ "$release" ] ; then
+		kernel_detect
+		kernel_switch
+		kernel_initrd
+	fi
+	;;
+-S|--status)
+	kernel_status
+	call find "$chroot/boot" -name 'vmlinuz-*' -printf '%f\n' | sed "s,vmlinuz-,," | sort
+	;;
+-T|--tar)
+	launchpad_create
+	kernel_unpack "$1" || exit
+	D=${2:-kernel-$suffix.tgz}
+	tar czf "$D" -C "$launchpad" boot lib/modules
+	launchpad_destroy
+	exit
+	;;
+-X|--kexec)
+	kernel_detect
+	kernel_check
+	kernel_switch
+	kernel_append ${chroot:+"chroot=$chroot"} "$@"
+	kernel_kexec
+	kernel_reboot
+	exit
+	;;
+-P|--panic)
+	kernel_detect
+	kernel_check
+	kernel_switch
+	kernel_append ${chroot:+"chroot=$chroot"} "$@"
+	kernel_panic
+	exit
+	;;
+-x|--xexec)
+	xexec=1
+	;;
+-L|--link)
+	kernel_detect
+	kernel_check
+	kernel_switch
+	[ "$kernel" ] && call ln -sf $(basename $kernel) "$chroot/boot/vmlinuz$1"
+	[ "$initrd" ] && call ln -sf $(basename $initrd) "$chroot/boot/initrd.img$1"
+	;;
+-U|--uninstall)
+	kernel_remove "$1"
+	shift
+	;;
+-B|--reboot)
+	kernel_reboot
+	;;
+-M|--renick)
+	kernel_detect
+	kernel_renick "$1"
+	shift
+	;;
+-n|--no-initrd)
+	no_initrd=1
+	;;
+-k|--kernel)
+	kernel="$1"
+	shift
+	;;
+-i|--initrd)
+	initrd="$1"
+	shift
+	;;
+-a|--append)
+	append="$1"
+	shift
+	;;
+-d|--debug)
+	set -x
+	;;
+-v|--verbose)
+	verbose() {
+		echo $@ 1>&2
+	}
+	verbose=1
+	unset quiet
+	;;
+*)
+	echo "unknown $command"
+	exit 2
+	;;
+esac ; done
+
+portal_clean

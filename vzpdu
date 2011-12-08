@@ -1,0 +1,14 @@
+#!/bin/sh
+
+pdu="vzpdu.sw.ru"
+opt="-c private -v 1 -m +PowerNet-MIB"
+out="rPDUOutletControlOutletCommand.$2"
+
+case "$1" in
+""|help)	echo "usage: vzpdu <list> | <status|on|up|off|down|reboot|reset> <outlet>" ;;
+list)		snmptable $opt $pdu rPDUOutletStatusTable	;;
+status|info)	snmpget	  $opt $pdu $out			;;
+on|up)		snmpset   $opt $pdu $out = immediateOn		;;
+off|down)	snmpset   $opt $pdu $out = immediateOff		;;
+reboot|reset)	snmpset	  $opt $pdu $out = immediateReboot	;;
+esac

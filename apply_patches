@@ -1,0 +1,74 @@
+#!/bin/bash
+
+function refresh_repo {
+	echo "Adding new files to git...";
+	git add -f . > /dev/null
+	if [ $? -ne 0 ]; then
+		echo "Failed: error "$?;
+		exit 1;
+	fi;
+	echo "Commiting changes...";
+	if [ $? -ne 0 ]; then
+		echo "Failed: error "$?;
+		exit 1;
+	fi;
+	git commit -m "$1" > /dev/null
+}
+
+function apply {
+	while read line 
+	do
+		if [ -n "$line" ] && [ -z "$(echo $line | grep "^#")" ]; then 
+			if [ -n "$(echo $line | grep "include ")" ]; then
+				nested_list=`echo $line | sed 's/include //'`;
+				echo "Found nested list "$nested_list;
+				apply $nested_list
+			else
+				# Drop comment after patch
+				line=`echo $line | sed s/#\.*//g`
+				echo $line;
+				patch --dry-run -p1 < $folder/$line > /dev/null;
+				if [ $? -ne 0 ]; then
+					echo "Applying patch '"$line"' failed"
+					echo "Rollback changes..."
+					git reset --hard > /dev/null
+					git clean -fd > /dev/null
+					exit 1;
+				fi;
+				patch -p1 < $folder/$line > /dev/null;
+			fi;
+		fi;
+	done < $folder/$1;
+}
+
+git status &> /dev/null
+if [ $? -ne 0 ]; then
+	echo "Creating empty git repo...";
+	git init > /dev/null
+	if [ $? -ne 0 ]; then
+		echo "Failed: error "$?;
+		exit 1;
+	fi;
+	refresh_repo "Initial commit"
+fi;
+
+if [ ! -e $1 ]; then
+	echo "File is not present: "$1
+	exit 1
+fi
+
+folder=`dirname $1`
+list=`basename $1`
+echo "List name: "$list
+echo "Folder: "$folder
+
+echo "Processing "$1;
+
+apply $list
+
+echo "Patches applied";
+
+#refresh_repo "$list list"
+
+echo "Successfully completed"
+

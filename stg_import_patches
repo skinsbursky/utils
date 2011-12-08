@@ -1,0 +1,41 @@
+#!/bin/bash
+folder=`dirname $1`
+list=`basename $1`
+
+stg_series=/tmp/series
+stg series > $stg_series
+
+echo "List name: "$list
+echo "Folder: "$folder
+
+
+function apply {
+	echo "-------------- Start processing "$1;
+	while read line 
+	do
+		if [ -n "$line" ] && [ -z "$(echo $line | grep "#")" ]; then 
+			if [ -n "$(echo $line | grep "include ")" ]; then
+				nested_list=`echo $line | sed 's/include //'`;
+				echo "-------------- Found nested list "$nested_list;
+				apply $nested_list
+			else
+#				if [ -z "$(stg series | grep "$line")" ]; then 
+				if [ -z "$(cat $stg_series | grep "$line")" ]; then 
+					echo $line;
+					stg import $folder/$line;
+					if [ $? -ne 0 ]; then
+						echo "Failed: error "$?;
+						exit 1;
+					fi;
+				fi;
+			fi;
+		fi;
+	done < $folder/$1;
+	echo "-------------- Stop processing "$1;
+}
+
+apply $list
+
+#stg commit -a
+
+echo "-------------- Success --------------"
